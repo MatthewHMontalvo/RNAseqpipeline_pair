@@ -129,7 +129,7 @@ for file in "$TRIMMED_DIR"/*_trimmed_*.fastq.gz; do
     fi
 done
 
-# STEP 3: Paired-end alignment
+# STEP 3: Paired-end alignment (corrected section)
 index_files=("$HISAT2_INDEX".*.ht2)
 if [ ! -f "${index_files[0]}" ]; then
     echo "ERROR: HISAT2 index not found at $HISAT2_INDEX"
@@ -148,15 +148,29 @@ for r1_file in "$TRIMMED_DIR"/*_R1_trimmed_paired.fastq.gz; do
         hisat2_cmd="hisat2 -q -x $HISAT2_INDEX -1 $r1_file -2 $r2_file -p $THREADS"
         [ -n "$strand" ] && hisat2_cmd+=" --rna-strandness $strand"
         
-        if ! $hisat2_cmd | samtools sort -@ "$THREADS" -o "$bam"; then
+        # Modified alignment pipeline with temp file and validation
+        if ! $hisat2_cmd \
+            | samtools view -@ $THREADS -bh \
+            | samtools sort -@ $THREADS -o "$bam.tmp" - 
+        then
             echo "ERROR: Alignment failed for $base" >&2
+            rm -f "$bam.tmp"
             exit 1
         fi
+        
+        # Finalize BAM file
+        mv "$bam.tmp" "$bam"
+        
+        # Validate BAM file
+        samtools quickcheck "$bam" || { 
+            echo "ERROR: Corrupted BAM $bam" >&2
+            exit 1
+        }
         samtools index -@ "$THREADS" "$bam"
     fi
 done
 
-# STEP 4: Quantification with featureCounts
+# STEP 4: Quantification with featureCounts (corrected strandedness handling)
 if [ ! -f "$QUANT_DIR/featurecounts_results.txt" ]; then
     echo "Running featureCounts..."
     samples=()
@@ -169,18 +183,14 @@ if [ ! -f "$QUANT_DIR/featurecounts_results.txt" ]; then
         strands+=("$(get_strandedness "$sample" "featureCounts")")
     done < "$STRANDEDNESS_FILE"
 
-    unique_strands=$(printf "%s\n" "${strands[@]}" | sort -u | wc -l)
-    if [ "$unique_strands" -ne 1 ]; then
-        echo "WARNING: Mixed strandedness detected. Using most common strand" >&2
-    fi
+    # Get strandedness from first sample (assuming consistent across all)
+    read -r first_sample first_strand <<< "$(head -n1 "$STRANDEDNESS_FILE")"
+    fc_strand=$(get_strandedness "$first_sample" "featureCounts")
 
-    common_strand=$(printf "%s\n" "${strands[@]}" | sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
-
-# Add -p for paired-end and adjust strandedness parameter
-featureCounts -T "$THREADS" -p -s 2 -a "$ANNOTATION" \
-    -o "$QUANT_DIR/featurecounts_results.txt" "${samples[@]}" || {
-        echo "featureCounts failed"; exit 1;
-    }
+    featureCounts -T "$THREADS" -p -s "$fc_strand" -a "$ANNOTATION" \
+        -o "$QUANT_DIR/featurecounts_results.txt" "${samples[@]}" || {
+            echo "featureCounts failed"; exit 1;
+        }
 fi
 
 # STEP 5: HTSeq counting
